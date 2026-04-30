@@ -1,0 +1,31 @@
+# Local development only. In Coolify, BD and scraper are deployed as separate resources.
+services:
+  postgres:
+    image: timescale/timescaledb-ha:pg16
+    environment:
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: comboios
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/home/postgres/pgdata/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  scraper:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/comboios
+      UPSTREAM_BASE: https://comboios.live/api
+      LOG_LEVEL: debug
+      NODE_ENV: development
+    restart: unless-stopped
+
+volumes:
+  pgdata:
