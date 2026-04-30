@@ -1,5 +1,6 @@
 import { runMigrations, pool } from "./db.js";
 import { startScraper } from "./scraper.js";
+import { startAggregator } from "./aggregator.js";
 import { log } from "./log.js";
 
 async function shutdown(signal: string, code = 0): Promise<never> {
@@ -18,6 +19,15 @@ process.on("SIGINT", () => void shutdown("SIGINT"));
 async function main(): Promise<void> {
     log.info("comboios scraper boot");
     await runMigrations();
+
+    // Start the aggregator loop in parallel (non-blocking; it sleeps until 03:00).
+    void startAggregator().catch((err) =>
+        log.error(
+            { err: (err as Error).message },
+            "aggregator loop crashed; scraper continues",
+        ),
+    );
+
     await startScraper();
 }
 
