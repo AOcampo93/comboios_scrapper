@@ -1,0 +1,3 @@
+# Run daily at 03:30 UTC — half an hour after the aggregator finishes, so the
+# backup includes the freshly-aggregated tables but doesn't compete for I/O.
+30 3 * * * /app/run-backup.sh
