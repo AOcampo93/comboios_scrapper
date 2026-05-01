@@ -35,9 +35,10 @@ async function aggregateDwellEvents(runDate: string): Promise<number> {
         ts: string;
         status: string;
         last_station: string | null;
+        delay_seconds: number | null;
     }>(
         `
-        SELECT train_number, run_date, ts, status, last_station
+        SELECT train_number, run_date, ts, status, last_station, delay_seconds
         FROM train_snapshots
         WHERE run_date = $1::date
         ORDER BY train_number, ts ASC
@@ -50,6 +51,7 @@ async function aggregateDwellEvents(runDate: string): Promise<number> {
         run_date: string;
         station_code: string;
         arrived_at: string;
+        delay_at_arrival: number | null;
     };
 
     const events: Array<Open & { departed_at: string }> = [];
@@ -79,6 +81,7 @@ async function aggregateDwellEvents(runDate: string): Promise<number> {
                     run_date: r.run_date,
                     station_code: r.last_station,
                     arrived_at: r.ts,
+                    delay_at_arrival: r.delay_seconds,
                 };
             }
         } else {
@@ -94,9 +97,11 @@ async function aggregateDwellEvents(runDate: string): Promise<number> {
         const res = await pool.query(
             `
             INSERT INTO station_dwell_events
-                (train_number, run_date, station_code, arrived_at, departed_at, dwell_seconds)
+                (train_number, run_date, station_code, arrived_at, departed_at,
+                 dwell_seconds, delay_at_arrival_seconds)
             VALUES ($1, $2, $3, $4::timestamptz, $5::timestamptz,
-                    EXTRACT(EPOCH FROM ($5::timestamptz - $4::timestamptz))::int)
+                    EXTRACT(EPOCH FROM ($5::timestamptz - $4::timestamptz))::int,
+                    $6)
             ON CONFLICT (train_number, run_date, station_code, arrived_at) DO NOTHING
             `,
             [
@@ -105,6 +110,7 @@ async function aggregateDwellEvents(runDate: string): Promise<number> {
                 e.station_code,
                 e.arrived_at,
                 e.departed_at,
+                e.delay_at_arrival,
             ],
         );
         inserted += res.rowCount ?? 0;
