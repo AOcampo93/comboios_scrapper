@@ -40,3 +40,21 @@ npm run dev
 ## Env vars
 
 See `.env.example`. The only required one is `DATABASE_URL`.
+
+## Seed data for development / pre-launch demos
+
+Before 30 days of real data have accumulated, you can populate
+`station_dwell_events` and `route_segments` with synthetic but realistic data
+so the frontend's reliability badges, scores, and (future) heatmaps light up
+immediately.
+
+```bash
+DATABASE_URL=postgres://... npm run seed       # ~1500 dwell events + ~1300 segments
+DATABASE_URL=postgres://... npm run seed:clean # remove all seed rows
+```
+
+Seed data uses real CP train numbers (528, 529, 4401, 4437, 3401), each with a
+distinct punctuality profile, and `run_date` strictly before today. Re-runs are
+idempotent (`ON CONFLICT DO NOTHING`). Once real data accumulates for 30 days,
+seed rows fall out of the reliability query window naturally — and
+`seed:clean` removes them explicitly.
