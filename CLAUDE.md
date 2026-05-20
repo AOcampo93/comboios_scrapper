@@ -97,6 +97,7 @@ train_line_map (005)               derived: train_number → route_id. Built fro
 | F3.5 Aggregator | dwell events + segments + segment_paths geometry + scheduled dwell |
 | F3.2 Backup | supercronic + pg_dump + rclone, 30d retention |
 | GTFS ingest | `src/gtfs.ts` — feed → gtfs_* tables + train_line_map; `npm run backfill` |
+| Prod backfill scripts | `src/scripts/backfill-{gtfs,aggregations}.ts` compile into `dist/` so they're runnable inside the runtime image via `docker exec ... node dist/scripts/<x>.js` |
 
 ## What's pending
 
@@ -107,6 +108,12 @@ train_line_map (005)               derived: train_number → route_id. Built fro
 - **`segment_paths` geometry only accrues forward**: it's built from
   `train_snapshots`, which drop after 14d. Historical segments get geometry as
   new runs are observed; there's no way to backfill older ones.
+- **GPS noise produces impossible speeds in `route_segments.avg_speed_kmh`**:
+  observed up to 558 km/h on real prod data (CP's fastest train is 220 km/h).
+  Brief positional jitter creates a tiny travel_seconds with a real
+  distance_km. Either filter `WHERE travel_seconds > N` in the aggregator
+  or clamp `avg_speed_kmh <= 230` in the heatmap endpoint. Latent in code
+  since 003.
 
 ## GTFS ingestion
 
@@ -116,6 +123,26 @@ A SHA-256 of the zip in `gtfs_meta` skips re-import of an unchanged feed.
 `train_short_name` in CP's GTFS **is the train number** — that's the join key
 for `train_line_map` and for scheduled-dwell. Run `npm run backfill` once to
 fill `scheduled_dwell_seconds`/`excess_seconds` on all historical dwell events.
+
+## Backfill scripts and the `src/scripts/` directory
+
+`src/scripts/` exists because the Dockerfile's runtime stage copies only
+`dist/` and `migrations/` — anything in `scripts/` at the repo root is
+**invisible at runtime**. Scripts that must run in production live in
+`src/scripts/` so that `tsc` compiles them to `dist/scripts/`. Dev-only
+scripts (`seed.ts`, `railGeometry.ts`) can stay in `scripts/` and run
+through `tsx`.
+
+| Script | Runtime command | Purpose |
+|--------|-----------------|---------|
+| `src/scripts/backfill-gtfs.ts` | `docker exec <scraper> node dist/scripts/backfill-gtfs.js` | Downloads the GTFS feed and fills `scheduled_dwell_seconds`/`excess_seconds` on every historical row in `station_dwell_events`. Idempotent (only touches rows where the column is NULL). |
+| `src/scripts/backfill-aggregations.ts` | `docker exec <scraper> node dist/scripts/backfill-aggregations.js` | Iterates every distinct UTC date in `train_snapshots` and calls `runAggregations()` for each, in chronological order. Use on first deploy of the heatmap pipeline to populate `segment_paths`/`route_segments` from accumulated GPS history instead of waiting one day per night. Idempotent. |
+
+Local dev uses `tsx`:
+```bash
+DATABASE_URL=... npm run backfill        # → tsx src/scripts/backfill-gtfs.ts
+DATABASE_URL=... npm run backfill-all    # → tsx src/scripts/backfill-aggregations.ts
+```
 
 ## Local dev
 
@@ -144,19 +171,38 @@ psql $DATABASE_URL -c "SELECT pg_size_pretty(pg_database_size('comboios'));"
 
 ## Last validated state
 
-**2026-05-17**: migrations 001-006 apply clean; `npm run seed` + `npm run backfill`
-import the live CP GTFS (185 routes / 1756 trips / 27870 stop_times) and fill
-`scheduled_dwell_seconds`+`excess_seconds` on all dwell events. `train_line_map`
-populated (1600 trains). Frontend history endpoints all return data — see that
-repo's CLAUDE.md. `segment_paths` geometry SQL verified in psql; not exercised
-by seed data (seed has no `train_snapshots`).
+**2026-05-20 — first end-to-end production validation of the heatmap
+pipeline.** Three redeploys were needed:
+1. Pre-existing commits did not include migrations 005/006 or `src/gtfs.ts`
+   (uncommitted on disk). After committing (`9519098`) and redeploying,
+   scraper crashed in `runMigrations()` with `connect ETIMEDOUT
+   172.18.0.2:5432` — the band-aided `docker network connect` was lost.
+2. Fix: switched the scraper's `DATABASE_URL` env var in Coolify from
+   `postgres://...@172.18.0.2:5432/...` to the hostname form
+   `postgres://...@db-x11j2gf0du0mz56h52zvbuhb:5432/...`. (The hostname
+   was already in `/etc/hosts` via Coolify's predefined-network feature
+   — see `--add-host` in the build log.) Redeployed; migrations 005/006
+   applied cleanly; GTFS sync ran on boot.
+3. Ran prod backfill (commit `c8ae05f`):
+   - `node dist/scripts/backfill-gtfs.js` updated 269,045 dwell events
+     with `scheduled_dwell_seconds`+`excess_seconds` in ~16s.
+   - `node dist/scripts/backfill-aggregations.js` processed 15 days of
+     `train_snapshots` (2026-05-06 → 2026-05-20) in ~13 min.
 
-**2026-05-01**: end-to-end chain working locally. Postgres + migrations +
-seed + frontend reading via `/api/reliability/train/528` returns
-`samples: 240, onTimePercent: 98.33%, source: "dwell"`. Visual badge confirmed
-in popup of train 4401 (live data + historical badge merged).
+After backfill: `/api/heatmap/speed` returns 1961 segments (median 65.8
+km/h, median 20 samples). `/api/heatmap/dwell` has `avgExcessSeconds`
+populated on 407/413 stations (median +72 s vs scheduled). Frontend
+heatmap visible in production.
 
-**Production status**: Coolify deployed with manual `docker network connect`
-band-aid (loses on redeploy). User needs to apply persistent fix
-(combined compose OR predefined network with hostname). `train_snapshots`
-empty until 05:00 Lisbon when scraper exits quiet period.
+**Outstanding from this validation**:
+- Frontend resource in Coolify still uses `DATABASE_URL=...172.18.0.2:5432...`.
+  Works today only because it has not been redeployed since that IP was
+  valid. Next redeploy of the frontend will ETIMEDOUT until its
+  `DATABASE_URL` is updated to `db-x11j2gf0du0mz56h52zvbuhb` too.
+- The 558 km/h outlier in `avg_speed_kmh` (see "What's pending") needs
+  filtering before the heatmap looks honest.
+
+**2026-05-17**: migrations 001-006 apply clean locally; `npm run seed` +
+`npm run backfill` import the live CP GTFS (185 routes / 1756 trips /
+27870 stop_times) and fill `scheduled_dwell_seconds`+`excess_seconds` on
+all dwell events. `train_line_map` populated (1600 trains).
