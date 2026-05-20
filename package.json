@@ -13,6 +13,7 @@
         "typecheck": "tsc --noEmit",
         "seed": "tsx scripts/seed.ts",
         "seed:clean": "tsx scripts/seed.ts --clean",
+        "seed:osm-geometry": "tsx scripts/seed-osm-geometry.ts",
         "backfill": "tsx src/scripts/backfill-gtfs.ts",
         "backfill-all": "tsx src/scripts/backfill-aggregations.ts"
     },
