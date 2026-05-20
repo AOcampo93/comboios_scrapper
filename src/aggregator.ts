@@ -151,14 +151,13 @@ async function aggregateRouteSegments(runDate: string): Promise<number> {
         const departed_at = prev.departed_at;
         const arrived_at = curr.arrived_at;
 
-        // Walk the GPS positions between the two timestamps: sum the distance and,
-        // in the same pass, stitch them into a polyline for segment_paths (used by
-        // the speed heatmap). LAG runs in the CTE; SUM and ST_MakeLine aggregate it.
-        const { rows: geo } = await pool.query<{
-            km: number | null;
-            point_count: number | null;
-            line_ewkt: string | null;
-        }>(
+        // Sum the GPS-measured distance the train covered between the two
+        // station timestamps. Used only to fill route_segments.distance_km
+        // (and from it avg_speed_kmh). The polyline geometry for segment_paths
+        // is no longer computed here — it's static OSM data, populated once by
+        // scripts/seed-osm-geometry.ts, and the heatmap endpoint joins
+        // route_segments onto it for colour.
+        const { rows: geo } = await pool.query<{ km: number | null }>(
             `
             WITH pts AS (
                 SELECT ts,
@@ -168,18 +167,14 @@ async function aggregateRouteSegments(runDate: string): Promise<number> {
                 WHERE train_number = $1
                   AND ts BETWEEN $2::timestamptz AND $3::timestamptz
             )
-            SELECT
-                COALESCE(SUM(ST_DistanceSphere(g, prev_g)) / 1000.0, 0)::float AS km,
-                COUNT(g)::int                                                  AS point_count,
-                ST_AsEWKT(ST_MakeLine(g ORDER BY ts))                          AS line_ewkt
+            SELECT COALESCE(SUM(ST_DistanceSphere(g, prev_g)) / 1000.0, 0)::float
+                AS km
             FROM pts
             `,
             [curr.train_number, departed_at, arrived_at],
         );
 
         const distanceKm = geo[0]?.km ?? 0;
-        const pointCount = geo[0]?.point_count ?? 0;
-        const lineEwkt = geo[0]?.line_ewkt ?? null;
         const travelSeconds =
             (new Date(arrived_at).getTime() - new Date(departed_at).getTime()) /
             1000;
@@ -210,25 +205,6 @@ async function aggregateRouteSegments(runDate: string): Promise<number> {
             ],
         );
         inserted += res.rowCount ?? 0;
-
-        // Upsert the canonical polyline for this station pair, keeping whichever
-        // run traced it with the most GPS points. ST_MakeLine yields a LINESTRING
-        // only with >= 2 points — degenerate runs are skipped.
-        if (lineEwkt && pointCount >= 2 && lineEwkt.includes("LINESTRING")) {
-            await pool.query(
-                `
-                INSERT INTO segment_paths
-                    (from_station, to_station, geometry, point_count, updated_at)
-                VALUES ($1, $2, $3::geography, $4, NOW())
-                ON CONFLICT (from_station, to_station) DO UPDATE
-                    SET geometry    = EXCLUDED.geometry,
-                        point_count = EXCLUDED.point_count,
-                        updated_at  = NOW()
-                    WHERE EXCLUDED.point_count >= segment_paths.point_count
-                `,
-                [prev.station_code, curr.station_code, lineEwkt, pointCount],
-            );
-        }
     }
     return inserted;
 }

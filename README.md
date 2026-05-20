@@ -41,6 +41,13 @@ Migration list:
 - `003_aggregates.sql` — `station_dwell_events`, `route_segments`
 - `004_dwell_delay.sql` — adds `delay_at_arrival_seconds` to `station_dwell_events`
   so reliability scoring works after the 14-day raw retention drops
+- `005_gtfs.sql` — `gtfs_routes` / `trips` / `stops` / `stop_times` / `calendar` /
+  `calendar_dates` / `gtfs_meta` + `train_line_map`. Adds the
+  `gtfs_time_to_seconds(text)` helper. Unlocks `scheduled_dwell_seconds`/
+  `excess_seconds` and train→line mapping.
+- `006_segment_paths.sql` — one GPS-traced LINESTRING per `(from_station,
+  to_station)` pair, written by the aggregator. Backs the frontend speed
+  heatmap (`/api/heatmap/speed`).
 
 ## Local dev
 
@@ -148,7 +155,25 @@ npm run dev               # tsx watch with auto-reload
 npm run build             # tsc to dist/
 npm run start             # node dist/index.js (production)
 npm run typecheck         # main project
-npx tsc --noEmit -p tsconfig.scripts.json   # typecheck scripts/ + src/
 npm run seed              # apply migrations + insert seed data
 npm run seed:clean        # remove all rows with run_date < today
+npm run backfill          # tsx src/scripts/backfill-gtfs.ts — fill scheduled_dwell/excess on every historical dwell event
+npm run backfill-all      # tsx src/scripts/backfill-aggregations.ts — replay every UTC date in train_snapshots through the aggregator
 ```
+
+## Production backfill (after first deploy of the heatmap pipeline)
+
+Inside the running scraper container (the Dockerfile compiles
+`src/scripts/` into `dist/scripts/`):
+
+```bash
+# 1. Backfill GTFS-derived columns on all historical dwell events
+docker exec <scraper-container> node dist/scripts/backfill-gtfs.js
+
+# 2. Backfill segment_paths + route_segments from accumulated GPS
+docker exec <scraper-container> node dist/scripts/backfill-aggregations.js
+```
+
+Both are idempotent — safe to re-run. The nightly aggregator handles new
+data going forward; these scripts exist only to seed historical data on
+first deploy.
