@@ -13,7 +13,8 @@
         "typecheck": "tsc --noEmit",
         "seed": "tsx scripts/seed.ts",
         "seed:clean": "tsx scripts/seed.ts --clean",
-        "backfill": "tsx scripts/backfill-gtfs.ts"
+        "backfill": "tsx src/scripts/backfill-gtfs.ts",
+        "backfill-all": "tsx src/scripts/backfill-aggregations.ts"
     },
     "dependencies": {
         "fflate": "^0.8.3",

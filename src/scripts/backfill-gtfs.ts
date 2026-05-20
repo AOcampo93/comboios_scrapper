@@ -8,11 +8,14 @@
  *
  * Idempotent: only touches rows where scheduled_dwell_seconds IS NULL.
  *
- * Usage:
- *   DATABASE_URL=... npm run backfill
+ * Usage (production, inside the running scraper container):
+ *   docker exec <scraper-container> node dist/scripts/backfill-gtfs.js
+ *
+ * Usage (local dev, from repo root):
+ *   DATABASE_URL=... npx tsx src/scripts/backfill-gtfs.ts
  */
-import { pool, runMigrations } from "../src/db.js";
-import { importGtfs } from "../src/gtfs.js";
+import { pool, runMigrations } from "../db.js";
+import { importGtfs } from "../gtfs.js";
 
 async function main(): Promise<void> {
     await runMigrations();
