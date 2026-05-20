@@ -1,6 +1,7 @@
 import { runMigrations, pool } from "./db.js";
 import { startScraper } from "./scraper.js";
 import { startAggregator } from "./aggregator.js";
+import { startGtfsSync } from "./gtfs.js";
 import { log } from "./log.js";
 
 async function shutdown(signal: string, code = 0): Promise<never> {
@@ -25,6 +26,14 @@ async function main(): Promise<void> {
         log.error(
             { err: (err as Error).message },
             "aggregator loop crashed; scraper continues",
+        ),
+    );
+
+    // GTFS sync in parallel too — imports the timetable on boot, then daily.
+    void startGtfsSync().catch((err) =>
+        log.error(
+            { err: (err as Error).message },
+            "gtfs sync loop crashed; scraper continues",
         ),
     );
 

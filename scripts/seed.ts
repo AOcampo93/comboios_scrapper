@@ -1,69 +1,40 @@
 /**
  * Synthetic seed data for development and PR-quality demos.
  *
- * Generates 30 days of realistic dwell events + route segments for a handful of
- * real CP train numbers, each with a distinct "punctuality personality" so the
- * reliability badges and future heatmaps show varied colors immediately.
+ * Generates ~3 weeks of realistic dwell events, route segments and segment
+ * geometry for EVERY train in CP's GTFS feed, each train following its real
+ * station sequence. The frontend's heatmap is per-train — it filters history to
+ * the selected train's GTFS trip — so seeding every train means whatever live
+ * train you click on the map has data behind it.
  *
- * Insertion uses ON CONFLICT DO NOTHING so re-runs are idempotent. All seeded
- * rows have run_date strictly before today, so once real data accumulates for
- * 30 days the synthetic rows fall out of the reliability query window naturally.
+ * Each train gets a deterministic "punctuality personality" (derived from its
+ * number) so reliability badges and heatmaps show varied colours.
+ *
+ * Re-runs append (timestamps differ each run); use `--clean` to reset first.
  *
  * Usage:
  *   npm run seed             # insert seed data
- *   npm run seed -- --clean  # delete all rows with run_date before today
+ *   npm run seed -- --clean  # delete every historical (run_date < today) row
  */
 import { pool, runMigrations } from "../src/db.js";
+import { importGtfs } from "../src/gtfs.js";
+import { buildRailRouter, type LonLat } from "./railGeometry.js";
 
-interface TrainProfile {
-    number: number;
-    line: string;
-    /** Mean delay in seconds at the start of the trip. */
-    baseDelay: number;
-    /** Standard deviation of delay across runs. */
-    delayStd: number;
-    /** Probability of cancellation per day (0..1). */
-    cancelProb: number;
-    /** Stations the train serves, in order. */
-    stations: Array<{ code: string; lat: number; lon: number; designation: string }>;
+const SEED_DAYS = 21;
+
+interface Station {
+    code: string;
+    lat: number;
+    lon: number;
 }
 
-// Real station coords sampled from CP (Linha do Norte + Cascais snippets).
-const STATIONS = {
-    PORTO: { code: "94-2006", lat: 41.1487, lon: -8.5848, designation: "Porto Campanhã" },
-    GAIA: { code: "94-39164", lat: 41.1297, lon: -8.6204, designation: "Vila Nova de Gaia - Devesas" },
-    ESPINHO: { code: "94-39008", lat: 41.0065, lon: -8.6443, designation: "Espinho" },
-    OVAR: { code: "94-38299", lat: 40.864, lon: -8.6166, designation: "Ovar" },
-    AVEIRO: { code: "94-38000", lat: 40.6434, lon: -8.6407, designation: "Aveiro" },
-    COIMBRA_B: { code: "94-36004", lat: 40.2079, lon: -8.4569, designation: "Coimbra-B" },
-    ENTRONCAMENTO: { code: "94-34009", lat: 39.4644, lon: -8.4747, designation: "Entroncamento" },
-    SANTAREM: { code: "94-32185", lat: 39.2349, lon: -8.685, designation: "Santarém" },
-    ORIENTE: { code: "94-31278", lat: 38.7686, lon: -9.0939, designation: "Lisboa Oriente" },
-    LISBOA_SA: { code: "94-30007", lat: 38.7167, lon: -9.1167, designation: "Lisboa Santa Apolónia" },
-} as const;
-
-const PROFILES: TrainProfile[] = [
-    {
-        number: 528, line: "Norte", baseDelay: 90, delayStd: 60, cancelProb: 0.02,
-        stations: [STATIONS.PORTO, STATIONS.GAIA, STATIONS.ESPINHO, STATIONS.OVAR, STATIONS.AVEIRO, STATIONS.COIMBRA_B, STATIONS.ENTRONCAMENTO, STATIONS.LISBOA_SA],
-    },
-    {
-        number: 529, line: "Norte", baseDelay: 480, delayStd: 180, cancelProb: 0.05,
-        stations: [STATIONS.LISBOA_SA, STATIONS.ENTRONCAMENTO, STATIONS.COIMBRA_B, STATIONS.AVEIRO, STATIONS.OVAR, STATIONS.ESPINHO, STATIONS.GAIA, STATIONS.PORTO],
-    },
-    {
-        number: 4401, line: "Cintura", baseDelay: 30, delayStd: 30, cancelProb: 0.01,
-        stations: [STATIONS.LISBOA_SA, STATIONS.ORIENTE, STATIONS.SANTAREM, STATIONS.ENTRONCAMENTO],
-    },
-    {
-        number: 4437, line: "Cintura", baseDelay: 180, delayStd: 90, cancelProb: 0.03,
-        stations: [STATIONS.LISBOA_SA, STATIONS.ORIENTE, STATIONS.SANTAREM, STATIONS.ENTRONCAMENTO],
-    },
-    {
-        number: 3401, line: "Norte", baseDelay: 120, delayStd: 240, cancelProb: 0.04,
-        stations: [STATIONS.ENTRONCAMENTO, STATIONS.COIMBRA_B, STATIONS.AVEIRO, STATIONS.OVAR, STATIONS.ESPINHO, STATIONS.PORTO],
-    },
-];
+/** A distinct (from → to) station pair, kept so its geometry is built once. */
+interface PairMeta {
+    from: string;
+    to: string;
+    fromLonLat: LonLat;
+    toLonLat: LonLat;
+}
 
 // ---------- math helpers ----------
 
@@ -75,7 +46,7 @@ function gauss(mean: number, std: number): number {
 }
 
 /** Haversine distance in km between two lat/lon points. */
-function distanceKm(a: { lat: number; lon: number }, b: { lat: number; lon: number }): number {
+function distanceKm(a: Station, b: Station): number {
     const toRad = (x: number) => (x * Math.PI) / 180;
     const R = 6371;
     const dLat = toRad(b.lat - a.lat);
@@ -86,163 +57,351 @@ function distanceKm(a: { lat: number; lon: number }, b: { lat: number; lon: numb
     return 2 * R * Math.asin(Math.sqrt(aa));
 }
 
-// ---------- seed logic ----------
+/**
+ * A stable speed character for a physical segment, ~0.55 (chronically slow) …
+ * ~1.5 (fast stretch). Derived from the station pair so it's identical for every
+ * train and every day — meaning it survives the per-pair averaging in
+ * /api/heatmap/speed and gives the heatmap a real green/yellow/red spread.
+ */
+function pairSpeedFactor(a: string, b: string): number {
+    const s = a < b ? a + b : b + a;
+    let h = 0;
+    for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) | 0;
+    return 0.55 + ((Math.abs(h) % 1000) / 1000) * 0.95;
+}
 
-async function seedDay(date: Date, profile: TrainProfile): Promise<{ dwell: number; segs: number; cancelled: boolean }> {
-    if (Math.random() < profile.cancelProb) {
-        return { dwell: 0, segs: 0, cancelled: true };
-    }
-
-    const runDate = date.toISOString().slice(0, 10);
-    const dayOfWeek = date.getDay();
-
-    // Trip starts somewhere between 06:00 and 21:00 deterministically per train.
-    const startHour = 6 + ((profile.number * 13) % 16);
-    let cursor = new Date(date);
-    cursor.setHours(startHour, 0, 0, 0);
-
-    let currentDelay = Math.max(0, gauss(profile.baseDelay, profile.delayStd));
-
-    type Event = {
-        station_code: string;
-        arrived_at: Date;
-        departed_at: Date;
-        delay_at_arrival: number;
-        from_lat: number;
-        from_lon: number;
-        to_lat: number;
-        to_lon: number;
+/** Deterministic punctuality personality derived from the train number. */
+function personality(n: number): { baseDelay: number; delayStd: number; cancelProb: number } {
+    return {
+        baseDelay: 20 + ((n * 37) % 520), // ~20s … ~9min typical starting delay
+        delayStd: 25 + ((n * 53) % 200),
+        cancelProb: ((n * 17) % 45) / 1500, // 0 … 0.03 per day
     };
-    const events: Event[] = [];
+}
 
-    for (let i = 0; i < profile.stations.length; i++) {
-        const station = profile.stations[i];
-        const arrivedAt = new Date(cursor.getTime() + currentDelay * 1000);
-        const dwellSec = 25 + Math.random() * 50; // 25–75s
-        const departedAt = new Date(arrivedAt.getTime() + dwellSec * 1000);
+// ---------- GTFS lookups ----------
 
-        events.push({
-            station_code: station.code,
-            arrived_at: arrivedAt,
-            departed_at: departedAt,
-            delay_at_arrival: Math.round(currentDelay),
-            from_lat: i === 0 ? station.lat : profile.stations[i - 1].lat,
-            from_lon: i === 0 ? station.lon : profile.stations[i - 1].lon,
-            to_lat: station.lat,
-            to_lon: station.lon,
-        });
+/** Every numeric train number present in the loaded GTFS feed. */
+async function allGtfsTrainNumbers(): Promise<number[]> {
+    const { rows } = await pool.query<{ trip_short_name: string }>(
+        `SELECT DISTINCT trip_short_name FROM gtfs_trips
+         WHERE trip_short_name ~ '^[0-9]+$'`,
+    );
+    return rows.map((r) => Number(r.trip_short_name)).sort((a, b) => a - b);
+}
 
-        // Travel time to next station: ~1.2 min/km at 50 km/h average. Add small drift.
-        if (i < profile.stations.length - 1) {
-            const next = profile.stations[i + 1];
-            const km = distanceKm(station, next);
-            const travelSec = (km / 50) * 3600;
-            cursor = new Date(departedAt.getTime() + travelSec * 1000);
-            currentDelay = Math.max(0, currentDelay + gauss(0, 30));
+/** Real ordered station sequence for a train, from the loaded GTFS feed. */
+async function stationsForTrain(trainNumber: number): Promise<Station[]> {
+    const { rows } = await pool.query<{
+        stop_id: string;
+        stop_lat: number | null;
+        stop_lon: number | null;
+    }>(
+        `
+        SELECT s.stop_id, s.stop_lat, s.stop_lon
+        FROM gtfs_stop_times st
+        JOIN gtfs_stops s ON s.stop_id = st.stop_id
+        WHERE st.trip_id = (
+            SELECT trip_id FROM gtfs_trips
+            WHERE trip_short_name = $1 ORDER BY trip_id LIMIT 1
+        )
+        ORDER BY st.stop_sequence
+        `,
+        [String(trainNumber)],
+    );
+    return rows
+        .filter((r) => r.stop_lat != null && r.stop_lon != null)
+        .map((r) => ({
+            // live/seed station codes use a hyphen; GTFS stop_id uses an underscore
+            code: r.stop_id.replace("_", "-"),
+            lat: Number(r.stop_lat),
+            lon: Number(r.stop_lon),
+        }));
+}
+
+// ---------- batched insert ----------
+
+type Row = (string | number | null)[];
+
+/** Plain `($1,$2,…,$n)` placeholder builder for an n-column table. */
+const plain = (n: number) => (offset: number) =>
+    "(" + Array.from({ length: n }, (_, k) => `$${offset + k + 1}`).join(",") + ")";
+
+async function batchInsert(
+    table: string,
+    columns: string[],
+    rows: Row[],
+    placeholderRow: (offset: number) => string,
+    conflict: string,
+): Promise<void> {
+    if (rows.length === 0) return;
+    const perRow = columns.length;
+    const chunkSize = Math.max(1, Math.floor(60000 / perRow));
+    for (let i = 0; i < rows.length; i += chunkSize) {
+        const chunk = rows.slice(i, i + chunkSize);
+        const values = chunk.map((_, ri) => placeholderRow(ri * perRow)).join(",");
+        await pool.query(
+            `INSERT INTO ${table} (${columns.join(",")}) VALUES ${values} ${conflict}`,
+            chunk.flat(),
+        );
+    }
+}
+
+// ---------- generation ----------
+
+/** Build all dwell + segment rows for one train across SEED_DAYS days. */
+function generateTrain(
+    trainNumber: number,
+    stations: Station[],
+    today: Date,
+    pairsByKey: Map<string, PairMeta>,
+): { dwellRows: Row[]; segRows: Row[]; cancelledDays: number } {
+    const p = personality(trainNumber);
+    // Trip starts somewhere between 06:00 and 21:00, deterministic per train.
+    const startHour = 6 + ((trainNumber * 13) % 16);
+
+    const dwellRows: Row[] = [];
+    const segRows: Row[] = [];
+    let cancelledDays = 0;
+
+    for (let d = SEED_DAYS; d > 0; d--) {
+        const date = new Date(today);
+        date.setDate(today.getDate() - d);
+        if (Math.random() < p.cancelProb) {
+            cancelledDays++;
+            continue;
         }
-    }
 
-    // Insert dwell events.
-    let dwellInserted = 0;
-    for (const e of events) {
-        const res = await pool.query(
-            `
-            INSERT INTO station_dwell_events
-                (train_number, run_date, station_code, arrived_at, departed_at,
-                 dwell_seconds, delay_at_arrival_seconds)
-            VALUES ($1, $2, $3, $4, $5,
-                    EXTRACT(EPOCH FROM ($5::timestamptz - $4::timestamptz))::int, $6)
-            ON CONFLICT (train_number, run_date, station_code, arrived_at) DO NOTHING
-            `,
-            [
-                profile.number,
-                runDate,
-                e.station_code,
-                e.arrived_at.toISOString(),
-                e.departed_at.toISOString(),
-                e.delay_at_arrival,
-            ],
-        );
-        dwellInserted += res.rowCount ?? 0;
-    }
+        const runDate = date.toISOString().slice(0, 10);
+        const dayOfWeek = date.getDay();
+        const start = new Date(date);
+        start.setHours(startHour, 0, 0, 0);
 
-    // Insert route segments between consecutive events.
-    let segsInserted = 0;
-    for (let i = 1; i < events.length; i++) {
-        const prev = events[i - 1];
-        const curr = events[i];
-        const departed_at = prev.departed_at;
-        const arrived_at = curr.arrived_at;
-        const travelSec = (arrived_at.getTime() - departed_at.getTime()) / 1000;
-        const km = distanceKm(
-            { lat: prev.to_lat, lon: prev.to_lon },
-            { lat: curr.to_lat, lon: curr.to_lon },
-        );
-        const avg = travelSec > 0 ? (km / travelSec) * 3600 : 0;
-        const res = await pool.query(
-            `
-            INSERT INTO route_segments
-                (train_number, run_date, from_station, to_station, departed_at, arrived_at,
-                 travel_seconds, distance_km, avg_speed_kmh, day_of_week)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
-            ON CONFLICT (train_number, run_date, from_station, to_station, departed_at)
-            DO NOTHING
-            `,
-            [
-                profile.number,
+        let sched = start.getTime(); // scheduled arrival at the current station
+        let delay = Math.max(0, gauss(p.baseDelay, p.delayStd));
+
+        const events: {
+            st: Station;
+            arrivedAt: Date;
+            departedAt: Date;
+            dwellSec: number;
+            delay: number;
+        }[] = [];
+
+        for (let i = 0; i < stations.length; i++) {
+            const st = stations[i];
+            const arrivedAt = new Date(sched + delay * 1000);
+            const dwellSec = Math.round(25 + Math.random() * 50); // 25–75s
+            const departedAt = new Date(arrivedAt.getTime() + dwellSec * 1000);
+            events.push({ st, arrivedAt, departedAt, dwellSec, delay: Math.round(delay) });
+
+            if (i < stations.length - 1) {
+                const next = stations[i + 1];
+                const km = distanceKm(st, next);
+                // Cruising speed = a distance baseline (long hops faster) scaled
+                // by the segment's stable speed character, so the heatmap shows
+                // a real green / yellow / red spread instead of one flat colour.
+                const factor = pairSpeedFactor(st.code, next.code);
+                const nominalKmh = Math.min(
+                    130,
+                    Math.max(
+                        20,
+                        (34 + Math.min(km, 45) * 1.45) * factor + gauss(0, 8),
+                    ),
+                );
+                const travelSec = (km / nominalKmh) * 3600;
+                // Advance the SCHEDULED clock. Delay shifts arrival times but
+                // not segment travel time — only the change in delay does — so
+                // avg speed stays realistic instead of being dragged to zero.
+                sched += (dwellSec + travelSec) * 1000;
+                delay = Math.max(0, delay + gauss(0, 30));
+            }
+        }
+
+        for (const e of events) {
+            dwellRows.push([
+                trainNumber,
                 runDate,
-                prev.station_code,
-                curr.station_code,
-                departed_at.toISOString(),
-                arrived_at.toISOString(),
-                Math.round(travelSec),
+                e.st.code,
+                e.arrivedAt.toISOString(),
+                e.departedAt.toISOString(),
+                e.dwellSec,
+                e.delay,
+            ]);
+        }
+
+        for (let i = 1; i < events.length; i++) {
+            const prev = events[i - 1];
+            const curr = events[i];
+            if (prev.st.code === curr.st.code) continue;
+            const travelSec = Math.round(
+                (curr.arrivedAt.getTime() - prev.departedAt.getTime()) / 1000,
+            );
+            const km = distanceKm(prev.st, curr.st);
+            const avg = travelSec > 0 ? (km / travelSec) * 3600 : 0;
+            segRows.push([
+                trainNumber,
+                runDate,
+                prev.st.code,
+                curr.st.code,
+                prev.departedAt.toISOString(),
+                curr.arrivedAt.toISOString(),
+                travelSec,
                 km,
                 avg,
                 dayOfWeek,
-            ],
-        );
-        segsInserted += res.rowCount ?? 0;
+            ]);
+
+            // Record each distinct pair once; geometry is traced after the loop.
+            const key = `${prev.st.code}|${curr.st.code}`;
+            if (!pairsByKey.has(key)) {
+                pairsByKey.set(key, {
+                    from: prev.st.code,
+                    to: curr.st.code,
+                    fromLonLat: [prev.st.lon, prev.st.lat],
+                    toLonLat: [curr.st.lon, curr.st.lat],
+                });
+            }
+        }
     }
 
-    return { dwell: dwellInserted, segs: segsInserted, cancelled: false };
+    return { dwellRows, segRows, cancelledDays };
 }
+
+// ---------- entry points ----------
 
 async function seed(): Promise<void> {
     await runMigrations();
+    await importGtfs();
 
     const today = new Date();
     today.setHours(0, 0, 0, 0);
 
-    let totals = { dwell: 0, segs: 0, cancelled: 0 };
-    for (let d = 30; d > 0; d--) {
-        const date = new Date(today);
-        date.setDate(today.getDate() - d);
-        for (const profile of PROFILES) {
-            const r = await seedDay(date, profile);
-            totals.dwell += r.dwell;
-            totals.segs += r.segs;
-            if (r.cancelled) totals.cancelled += 1;
+    const trains = await allGtfsTrainNumbers();
+    console.log(
+        JSON.stringify({ msg: "seeding all GTFS trains", trains: trains.length, days: SEED_DAYS }),
+    );
+
+    const pairsByKey = new Map<string, PairMeta>();
+    let totalDwell = 0;
+    let totalSegs = 0;
+    let cancelledDays = 0;
+    let seeded = 0;
+
+    for (const train of trains) {
+        const stations = await stationsForTrain(train);
+        if (stations.length < 2) continue;
+
+        const r = generateTrain(train, stations, today, pairsByKey);
+        await batchInsert(
+            "station_dwell_events",
+            [
+                "train_number",
+                "run_date",
+                "station_code",
+                "arrived_at",
+                "departed_at",
+                "dwell_seconds",
+                "delay_at_arrival_seconds",
+            ],
+            r.dwellRows,
+            plain(7),
+            "ON CONFLICT (train_number, run_date, station_code, arrived_at) DO NOTHING",
+        );
+        await batchInsert(
+            "route_segments",
+            [
+                "train_number",
+                "run_date",
+                "from_station",
+                "to_station",
+                "departed_at",
+                "arrived_at",
+                "travel_seconds",
+                "distance_km",
+                "avg_speed_kmh",
+                "day_of_week",
+            ],
+            r.segRows,
+            plain(10),
+            "ON CONFLICT (train_number, run_date, from_station, to_station, departed_at) DO NOTHING",
+        );
+
+        totalDwell += r.dwellRows.length;
+        totalSegs += r.segRows.length;
+        cancelledDays += r.cancelledDays;
+        seeded++;
+        if (seeded % 250 === 0) {
+            console.log(JSON.stringify({ msg: "progress", trainsSeeded: seeded }));
         }
     }
-    console.log(JSON.stringify({ msg: "seed complete", ...totals }));
+
+    // Trace each distinct segment along the real OSM rail network. Falls back to
+    // a straight line per pair if OSM is unavailable or a pair isn't routable.
+    console.log(JSON.stringify({ msg: "loading rail network from OSM" }));
+    const router = await buildRailRouter();
+    let railRouted = 0;
+    const pathRows: Row[] = [];
+    for (const m of pairsByKey.values()) {
+        let coords = router?.route(m.fromLonLat, m.toLonLat) ?? null;
+        if (coords && coords.length >= 2) {
+            railRouted++;
+        } else {
+            coords = [m.fromLonLat, m.toLonLat]; // straight-line fallback
+        }
+        const wkt =
+            "SRID=4326;LINESTRING(" +
+            coords.map((c) => `${c[0]} ${c[1]}`).join(",") +
+            ")";
+        pathRows.push([m.from, m.to, wkt, coords.length, new Date().toISOString()]);
+    }
+    console.log(
+        JSON.stringify({
+            msg: "segment geometry built",
+            pairs: pathRows.length,
+            railRouted,
+        }),
+    );
+    await batchInsert(
+        "segment_paths",
+        ["from_station", "to_station", "geometry", "point_count", "updated_at"],
+        pathRows,
+        (o) => `($${o + 1},$${o + 2},$${o + 3}::geography,$${o + 4},$${o + 5})`,
+        "ON CONFLICT (from_station, to_station) DO NOTHING",
+    );
+
+    console.log(
+        JSON.stringify({
+            msg: "seed complete",
+            trainsSeeded: seeded,
+            dwell: totalDwell,
+            segs: totalSegs,
+            paths: pathRows.length,
+            cancelledDays,
+        }),
+    );
 }
 
 async function clean(): Promise<void> {
     const today = new Date().toISOString().slice(0, 10);
-    const trainNumbers = PROFILES.map((p) => p.number);
+    // The seed only ever writes run_date < today, so this removes seed data
+    // without needing the train list. segment_paths has no run_date — wipe it
+    // wholesale (it's seed/aggregator-derived; real deploys rebuild it nightly).
     const r1 = await pool.query(
-        `DELETE FROM station_dwell_events WHERE train_number = ANY($1::int[]) AND run_date < $2::date`,
-        [trainNumbers, today],
+        `DELETE FROM station_dwell_events WHERE run_date < $1::date`,
+        [today],
     );
     const r2 = await pool.query(
-        `DELETE FROM route_segments WHERE train_number = ANY($1::int[]) AND run_date < $2::date`,
-        [trainNumbers, today],
+        `DELETE FROM route_segments WHERE run_date < $1::date`,
+        [today],
     );
+    const r3 = await pool.query(`DELETE FROM segment_paths`);
     console.log(
         JSON.stringify({
             msg: "cleanup complete",
             dwellRemoved: r1.rowCount ?? 0,
             segsRemoved: r2.rowCount ?? 0,
+            pathsRemoved: r3.rowCount ?? 0,
         }),
     );
 }

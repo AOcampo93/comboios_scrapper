@@ -10,6 +10,7 @@ export const config = {
     nodeEnv: process.env.NODE_ENV ?? "production",
     databaseUrl: required("DATABASE_URL"),
     upstreamBase: process.env.UPSTREAM_BASE ?? "https://comboios.live/api",
+    gtfsUrl: process.env.GTFS_URL ?? "https://publico.cp.pt/gtfs/gtfs.zip",
     userAgent:
         process.env.SCRAPER_USER_AGENT ??
         "comboios-history-scraper/0.1 (research, non-commercial)",
