@@ -20,10 +20,11 @@
  * disk by railGeometry.ts).
  *
  * Usage:
- *   npm run seed:osm-geometry
+ *   Dev:   npm run seed:osm-geometry
+ *   Prod:  docker exec <scraper-container> node dist/scripts/seed-osm-geometry.js
  */
-import { pool, runMigrations } from "../src/db.js";
-import { importGtfs } from "../src/gtfs.js";
+import { pool, runMigrations } from "../db.js";
+import { importGtfs } from "../gtfs.js";
 import { buildRailRouter, type LonLat } from "./railGeometry.js";
 
 interface Pair {

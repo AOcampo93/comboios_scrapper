@@ -18,7 +18,7 @@
  */
 import { pool, runMigrations } from "../src/db.js";
 import { importGtfs } from "../src/gtfs.js";
-import { buildRailRouter, type LonLat } from "./railGeometry.js";
+import { buildRailRouter, type LonLat } from "../src/scripts/railGeometry.js";
 
 const SEED_DAYS = 21;
 
