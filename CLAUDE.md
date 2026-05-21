@@ -73,10 +73,12 @@ route_segments                     permanent
 ├── avg_speed_kmh
 └── day_of_week (0=Sunday)
 
-segment_paths (006)                permanent — one GPS-traced polyline per
+segment_paths (006)                permanent — one OSM-routed polyline per
 ├── from_station, to_station (PK)  (from→to) pair, for the frontend speed heatmap
-├── geometry (GEOGRAPHY LINESTRING)
-└── point_count                    best-sampled run wins on conflict
+├── geometry (GEOGRAPHY LINESTRING) populated by seed-osm-geometry.ts (one-shot),
+└── point_count                    NOT by the aggregator. See "Static heatmap
+                                   geometry". point_count = 100_000 + vertex
+                                   count on OSM-seeded rows.
 
 gtfs_* (005)                       full-snapshot, TRUNCATE+reload each import:
                                    gtfs_routes / trips / stops / stop_times /
@@ -94,10 +96,11 @@ train_line_map (005)               derived: train_number → route_id. Built fro
 |------|-------|
 | F3.3 Schema | 6 migrations, idempotent runner |
 | F3.4 Scraper | polling + dedup + backoff + structured logs |
-| F3.5 Aggregator | dwell events + segments + segment_paths geometry + scheduled dwell |
+| F3.5 Aggregator | dwell events + segments + scheduled dwell (geometry NOT written here anymore — see "Static heatmap geometry") |
 | F3.2 Backup | supercronic + pg_dump + rclone, 30d retention |
 | GTFS ingest | `src/gtfs.ts` — feed → gtfs_* tables + train_line_map; `npm run backfill` |
 | Prod backfill scripts | `src/scripts/backfill-{gtfs,aggregations}.ts` compile into `dist/` so they're runnable inside the runtime image via `docker exec ... node dist/scripts/<x>.js` |
+| OSM geometry seeder | `src/scripts/seed-osm-geometry.ts` — one-shot. Replaces aggregator's GPS-derived `segment_paths` with OSM-routed paths. See "Static heatmap geometry". |
 
 ## What's pending
 
@@ -105,15 +108,49 @@ train_line_map (005)               derived: train_number → route_id. Built fro
   `cancellationPercent` field in the reliability endpoint, which is currently
   hardcoded to 0. Idea: add a `train_runs` table populated by the aggregator
   that records `cancelled` and `completed` flags from snapshots' status.
-- **`segment_paths` geometry only accrues forward**: it's built from
-  `train_snapshots`, which drop after 14d. Historical segments get geometry as
-  new runs are observed; there's no way to backfill older ones.
-- **GPS noise produces impossible speeds in `route_segments.avg_speed_kmh`**:
-  observed up to 558 km/h on real prod data (CP's fastest train is 220 km/h).
-  Brief positional jitter creates a tiny travel_seconds with a real
-  distance_km. Either filter `WHERE travel_seconds > N` in the aggregator
-  or clamp `avg_speed_kmh <= 230` in the heatmap endpoint. Latent in code
-  since 003.
+- **`seed-osm-geometry.ts` writes its OSM cache under `__dirname`** which
+  resolves to `/app/dist/scripts/` at runtime — read-only for the `node` user.
+  Workaround today is `docker exec -u 0`. Cleaner: read a `OSM_CACHE_DIR` env
+  var (default `__dirname` for dev) and set it to `/tmp` in the prod
+  container. Cache is only consulted on re-runs, so it's not blocking.
+- **GPS noise still produces impossible speeds in `route_segments.avg_speed_kmh`**
+  (up to 558 km/h observed). The heatmap endpoint clamps `avg_speed_kmh <= 220`
+  on read so the visible colour is honest, but the raw column still holds
+  outliers and would skew any future analytics. Filter at insert time when
+  someone needs the raw data clean.
+
+## Static heatmap geometry
+
+The rail network is static — OSM has it traced. Computing `segment_paths.geometry`
+from raw GPS pings was the original design (`aggregator.ts` had a
+`ST_MakeLine` block) and it was wrong: sparse polling produced 2–5 vertex
+polylines that drew as long straight diagonals across the country, forcing
+the app endpoint to filter them out with progressively complex heuristics
+(comboios_app PRs #2–#5, all reverted in #6).
+
+Since 2026-05-21:
+
+- **`src/scripts/seed-osm-geometry.ts`** is the only writer to
+  `segment_paths.geometry`. It runs once per deploy (or whenever the GTFS
+  feed introduces new stops), enumerating every consecutive `(stop, next stop)`
+  pair from `gtfs_stop_times` and routing each through Portugal's OSM rail
+  graph (`railGeometry.ts → buildRailRouter`). It also deletes orphan rows
+  — pairs not in GTFS, left over from express services skipping intermediate
+  stations.
+- **`aggregator.ts` no longer touches geometry.** Its job is to populate
+  `route_segments` (speed/time/distance per run) and `station_dwell_events`
+  scheduled-dwell. The aggregator's old upsert had a
+  `WHERE EXCLUDED.point_count >= segment_paths.point_count` guard; the seed
+  writes `point_count = 100_000 + vertices` so that guard can never overwrite
+  OSM with GPS even if the aggregator's writer is reintroduced by accident.
+
+Run order on first deploy of a fresh DB:
+1. `node dist/scripts/backfill-gtfs.js` — populates scheduled-dwell + GTFS tables
+2. `node dist/scripts/backfill-aggregations.js` — populates `route_segments`
+3. `node dist/scripts/seed-osm-geometry.js` — populates `segment_paths` from OSM
+
+The seed-osm-geometry step takes 1–3 min (downloads ~50 MB OSM data on first
+run, cached on disk thereafter).
 
 ## GTFS ingestion
 
@@ -129,14 +166,16 @@ fill `scheduled_dwell_seconds`/`excess_seconds` on all historical dwell events.
 `src/scripts/` exists because the Dockerfile's runtime stage copies only
 `dist/` and `migrations/` — anything in `scripts/` at the repo root is
 **invisible at runtime**. Scripts that must run in production live in
-`src/scripts/` so that `tsc` compiles them to `dist/scripts/`. Dev-only
-scripts (`seed.ts`, `railGeometry.ts`) can stay in `scripts/` and run
-through `tsx`.
+`src/scripts/` so that `tsc` compiles them to `dist/scripts/`. `railGeometry.ts`
+also lives under `src/scripts/` because both `seed.ts` (dev-only) and
+`seed-osm-geometry.ts` (prod-runnable) import it; only `seed.ts` itself stays
+at the repo root since it's never run in prod.
 
 | Script | Runtime command | Purpose |
 |--------|-----------------|---------|
 | `src/scripts/backfill-gtfs.ts` | `docker exec <scraper> node dist/scripts/backfill-gtfs.js` | Downloads the GTFS feed and fills `scheduled_dwell_seconds`/`excess_seconds` on every historical row in `station_dwell_events`. Idempotent (only touches rows where the column is NULL). |
-| `src/scripts/backfill-aggregations.ts` | `docker exec <scraper> node dist/scripts/backfill-aggregations.js` | Iterates every distinct UTC date in `train_snapshots` and calls `runAggregations()` for each, in chronological order. Use on first deploy of the heatmap pipeline to populate `segment_paths`/`route_segments` from accumulated GPS history instead of waiting one day per night. Idempotent. |
+| `src/scripts/backfill-aggregations.ts` | `docker exec <scraper> node dist/scripts/backfill-aggregations.js` | Iterates every distinct UTC date in `train_snapshots` and calls `runAggregations()` for each, in chronological order. Use on first deploy of the heatmap pipeline to populate `route_segments` from accumulated GPS history instead of waiting one day per night. Idempotent. |
+| `src/scripts/seed-osm-geometry.ts` | `docker exec -u 0 <scraper> node dist/scripts/seed-osm-geometry.js` | Routes every GTFS consecutive station pair through OSM and upserts `segment_paths` with the canonical curved geometry; deletes orphan rows (pairs not in GTFS). Needs `-u 0` today because the OSM cache file writes to `/app/dist/scripts/` — see "What's pending". |
 
 Local dev uses `tsx`:
 ```bash
@@ -170,6 +209,26 @@ psql $DATABASE_URL -c "SELECT pg_size_pretty(pg_database_size('comboios'));"
 ```
 
 ## Last validated state
+
+**2026-05-21 — OSM-only `segment_paths` deployed (PR #1 + PR #2).**
+
+The aggregator stopped writing geometry. `seed-osm-geometry.ts` was added
+and run once against prod via Coolify's internal
+`queue_application_deployment(...)` helper (its REST API is disabled by
+default). Output:
+
+```
+{"msg":"seed-osm-geometry complete","gtfsPairs":1220,"routedViaOsm":1218,
+ "straightFallback":2,"upserted":1220,"orphansDeleted":950}
+```
+
+950 GPS-derived orphan rows (express-service artefacts: chord 50–174 km
+straight diagonals) gone. The 2 straight-line fallbacks are stations OSM
+couldn't snap to a track within 4 km — terminal or non-rail-connected stops.
+
+`/api/heatmap/speed` now returns 1014 features in prod (down from 1793 with
+the old GPS-derived data + heuristic filters). Every visible segment follows
+OSM track curves end-to-end — same as the local seed.
 
 **2026-05-20 — first end-to-end production validation of the heatmap
 pipeline.** Three redeploys were needed:
