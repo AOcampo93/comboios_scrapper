@@ -45,9 +45,10 @@ Migration list:
   `calendar_dates` / `gtfs_meta` + `train_line_map`. Adds the
   `gtfs_time_to_seconds(text)` helper. Unlocks `scheduled_dwell_seconds`/
   `excess_seconds` and train→line mapping.
-- `006_segment_paths.sql` — one GPS-traced LINESTRING per `(from_station,
-  to_station)` pair, written by the aggregator. Backs the frontend speed
-  heatmap (`/api/heatmap/speed`).
+- `006_segment_paths.sql` — one LINESTRING per `(from_station, to_station)`
+  pair. **Since 2026-05-21 this is OSM-routed static data**, populated by
+  the one-shot `seed-osm-geometry` script. The aggregator no longer writes
+  here. Backs the frontend speed heatmap (`/api/heatmap/speed`).
 
 ## Local dev
 
@@ -157,6 +158,7 @@ npm run start             # node dist/index.js (production)
 npm run typecheck         # main project
 npm run seed              # apply migrations + insert seed data
 npm run seed:clean        # remove all rows with run_date < today
+npm run seed:osm-geometry # tsx src/scripts/seed-osm-geometry.ts — populate segment_paths from OSM, one-shot
 npm run backfill          # tsx src/scripts/backfill-gtfs.ts — fill scheduled_dwell/excess on every historical dwell event
 npm run backfill-all      # tsx src/scripts/backfill-aggregations.ts — replay every UTC date in train_snapshots through the aggregator
 ```
@@ -170,10 +172,13 @@ Inside the running scraper container (the Dockerfile compiles
 # 1. Backfill GTFS-derived columns on all historical dwell events
 docker exec <scraper-container> node dist/scripts/backfill-gtfs.js
 
-# 2. Backfill segment_paths + route_segments from accumulated GPS
+# 2. Backfill route_segments (speed/time/distance) from accumulated GPS
 docker exec <scraper-container> node dist/scripts/backfill-aggregations.js
+
+# 3. Populate segment_paths.geometry from OSM (one-shot, needs root for cache)
+docker exec -u 0 <scraper-container> node dist/scripts/seed-osm-geometry.js
 ```
 
-Both are idempotent — safe to re-run. The nightly aggregator handles new
-data going forward; these scripts exist only to seed historical data on
-first deploy.
+All three are idempotent — safe to re-run. The nightly aggregator handles
+`route_segments` going forward; the OSM geometry seed only needs re-running
+after GTFS adds new stops. See `CLAUDE.md` → "Static heatmap geometry".
