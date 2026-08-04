@@ -35,39 +35,70 @@ function tupleHash(v: Vehicle): string {
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
+/**
+ * Bound a promise that might never settle. This does NOT cancel the underlying
+ * work — it just lets the caller move on, which is the whole point: a wedged
+ * await must never be able to stop the next tick.
+ */
+function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+        const timer = setTimeout(
+            () => reject(new Error(`${label} exceeded ${ms}ms`)),
+            ms,
+        );
+        p.then(
+            (v) => {
+                clearTimeout(timer);
+                resolve(v);
+            },
+            (e) => {
+                clearTimeout(timer);
+                reject(e as Error);
+            },
+        );
+    });
+}
+
 async function fetchVehicles(): Promise<Vehicle[]> {
     const url = `${config.upstreamBase}/vehicles`;
-    let res: Response;
     try {
-        res = await fetch(url, {
+        const res = await fetch(url, {
             headers: {
                 "User-Agent": config.userAgent,
                 Accept: "application/json",
             },
             signal: AbortSignal.timeout(15_000),
         });
+
+        if (res.status === 429 || res.status === 503) {
+            const parsed = Number.parseInt(
+                res.headers.get("retry-after") ?? "60",
+                10,
+            );
+            // A missing/garbage header must not turn into sleep(NaN) (fires
+            // immediately, hammering upstream) nor an absurd multi-hour stall.
+            const retryAfter = Number.isFinite(parsed)
+                ? Math.min(Math.max(parsed, 1), 300)
+                : 60;
+            log.warn({ status: res.status, retryAfter }, "rate-limited; backing off");
+            await sleep(retryAfter * 1000);
+            return [];
+        }
+
+        if (!res.ok) {
+            log.error({ status: res.status }, "upstream returned non-ok");
+            return [];
+        }
+
+        // The body read MUST stay inside this try. AbortSignal.timeout firing
+        // mid-stream rejects here, not at the fetch above — letting that escape
+        // is what wedged the poller for 66 days from 2026-05-29.
+        const json = (await res.json()) as { vehicles?: Vehicle[] };
+        return json.vehicles ?? [];
     } catch (err) {
         log.error({ err: (err as Error).message, url }, "upstream fetch failed");
         return [];
     }
-
-    if (res.status === 429 || res.status === 503) {
-        const retryAfter = Number.parseInt(
-            res.headers.get("retry-after") ?? "60",
-            10,
-        );
-        log.warn({ status: res.status, retryAfter }, "rate-limited; backing off");
-        await sleep(retryAfter * 1000);
-        return [];
-    }
-
-    if (!res.ok) {
-        log.error({ status: res.status }, "upstream returned non-ok");
-        return [];
-    }
-
-    const json = (await res.json()) as { vehicles?: Vehicle[] };
-    return json.vehicles ?? [];
 }
 
 async function insertSnapshots(vehicles: Vehicle[]): Promise<number> {
@@ -138,11 +169,36 @@ export async function startScraper(): Promise<never> {
             upstream: config.upstreamBase,
             poll: config.pollIntervalMs,
             idle: config.idleIntervalMs,
+            tickTimeout: config.tickTimeoutMs,
+            watchdogStall: config.watchdogStallMs,
         },
         "scraper loop starting",
     );
 
+    // Liveness backstop. index.ts starts the aggregator and GTFS loops with
+    // `void`, so their timers keep the process (and the container) alive even
+    // when this loop is dead — which is exactly how the 2026-05-29 hang went
+    // unnoticed for 66 days. Nothing recovers a wedged loop except a restart,
+    // so exit non-zero and let the container's restart policy do it.
+    let lastLoopAt = Date.now();
+    // Deliberately NOT unref'd: this timer must be able to hold the process up
+    // on its own, so a stall always ends in a fatal log + exit(1) rather than a
+    // silent exit(0) that leaves no trace of why ingestion stopped.
+    setInterval(() => {
+        const stalledMs = Date.now() - lastLoopAt;
+        if (stalledMs > config.watchdogStallMs) {
+            log.fatal(
+                { stalledMs, limit: config.watchdogStallMs },
+                "poller loop stalled; exiting so the container restarts",
+            );
+            process.exit(1);
+        }
+    }, Math.min(60_000, config.watchdogStallMs / 2));
+
     while (true) {
+        // Advances on every iteration, idle ones included: what we're detecting
+        // is a loop that stopped turning, not an absence of trains.
+        lastLoopAt = Date.now();
         try {
             if (!isOperatingHours()) {
                 log.debug("outside operating hours; idling");
@@ -151,8 +207,16 @@ export async function startScraper(): Promise<never> {
             }
 
             const t0 = Date.now();
-            const vehicles = await fetchVehicles();
-            const inserted = await insertSnapshots(vehicles);
+            const vehicles = await withTimeout(
+                fetchVehicles(),
+                config.tickTimeoutMs,
+                "fetchVehicles",
+            );
+            const inserted = await withTimeout(
+                insertSnapshots(vehicles),
+                config.tickTimeoutMs,
+                "insertSnapshots",
+            );
             log.info(
                 { fetched: vehicles.length, inserted, ms: Date.now() - t0 },
                 "tick",

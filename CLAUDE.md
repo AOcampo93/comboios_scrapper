@@ -31,6 +31,46 @@ Every container restart runs `runMigrations()` from `src/db.ts`. It reads
 a transaction. Adding a new migration is just dropping a new file
 `005_thing.sql` — next deploy applies it.
 
+### The 2026-05-29 poller hang (and why the watchdog exists)
+
+The poller silently wedged on **2026-05-29 22:01:43 UTC** and stayed dead for
+**66 days**, until 2026-08-04. Nothing alerted, because nothing looked broken:
+`RestartCount=0`, `OOMKilled=false`, container `Up 2 months`, CPU 0.00%.
+
+`index.ts` starts `startAggregator()` and `startGtfsSync()` with `void`, so
+**their timers keep the process alive even when the poller loop is dead**. The
+logs kept showing GTFS imports and `aggregation: complete` daily — always with
+`dwell:0, segments:0`, because there were no snapshots to aggregate. That is
+the signature to recognise: *healthy-looking daily logs with zero counts.*
+
+Root cause: `await res.json()` sat **outside** the try/catch in
+`fetchVehicles`. `AbortSignal.timeout` fires during the body read, so it
+rejects there, not at the `fetch`. Forensic tell in the logs: `upstream fetch
+failed` carries a `url` field, `tick failed` does not — the last poller line
+was a `tick failed` with no `url`, i.e. an escapee from `res.json()`. Under
+Node 20 / undici that abort-during-body race can leave the promise **pending
+forever** instead of rejecting, and a `while (true)` loop awaiting a promise
+that never settles simply stops.
+
+Reproduced and fixed 2026-08-04. With the original code and a `fetch` stubbed
+to never settle: **0 ticks in 15 s**, process still alive — the outage exactly.
+Three defences now:
+
+1. `res.json()` moved inside the try/catch (plus `retry-after` clamped, since
+   a garbage header meant `sleep(NaN)` → immediate retry storm).
+2. `withTimeout()` bounds every tick await (`TICK_TIMEOUT_MS`, default 60 s).
+3. A watchdog exits the process with a `fatal` log if the loop stops iterating
+   for `WATCHDOG_STALL_MS` (default 15 min), so `unless-stopped` can restart
+   it. It is deliberately **not** `unref()`'d — otherwise a wedged poller with
+   no other timers would exit(0) silently, leaving no trace of the cause.
+
+**Symptom to watch for downstream:** every history endpoint filters
+`arrived_at > NOW() - INTERVAL '30/60 days'`, so an ingestion stall takes them
+all out at once, while `/api/heatmap/speed` and `/api/trips` keep returning
+200 (they read `segment_paths` / `route_segments` / `gtfs_*`, which have no
+time filter). "Only the heatmap works" means *ingestion stopped*, not a
+frontend or DB problem.
+
 ### Coolify networking gotcha (PROD)
 
 If running with separate Coolify resources (BD as Service, scraper as
